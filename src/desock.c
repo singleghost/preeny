@@ -20,7 +20,7 @@
 #define READ_BUF_SIZE 65536
 
 #define PREENY_SOCKET(x) (x+PREENY_SOCKET_OFFSET)
-
+#define PREENY_SOCKET_TIMEOUT -2
 int preeny_desock_shutdown_flag = 0;
 pthread_t *preeny_socket_threads_to_front[PREENY_MAX_FD] = { 0 };
 pthread_t *preeny_socket_threads_to_back[PREENY_MAX_FD] = { 0 };
@@ -35,6 +35,7 @@ int preeny_socket_sync(int from, int to, int timeout)
 	int r;
 
 	r = poll(&poll_in, 1, timeout);
+	preeny_debug("sync from %d to %d, poll revents number %d\n", from, to, poll_in.revents);	
 	if (r < 0)
 	{
 		strerror_r(errno, error_buf, 1024);
@@ -44,8 +45,18 @@ int preeny_socket_sync(int from, int to, int timeout)
 	else if (poll_in.revents == 0)
 	{
 		preeny_debug("read poll() timed out on fd %d\n", from);
-		return 0;
+		return -1;
 	}
+	else if (poll_in.revents & POLLNVAL) 
+	{
+		preeny_debug("poll revents POLLNVAL. read poll() fd %d is not valid\n", from);	
+		return -1;
+	}
+	else if (poll_in.revents & POLLHUP)
+	{
+		preeny_debug("poll revents POLLHUP. read poll() fd %d may disconnected\n", from);	
+		return -1;
+	} 
 
 	total_n = read(from, read_buf, READ_BUF_SIZE);
 	if (total_n < 0)
@@ -56,7 +67,7 @@ int preeny_socket_sync(int from, int to, int timeout)
 	}
 	else if (total_n == 0 && from == 0)
 	{
-		preeny_info("synchronization of fd %d to %d shutting down due to EOF\n");
+		preeny_info("synchronization of fd %d to %d shutting down due to EOF\n", from, to);
 		return -1;
 	}
 	preeny_debug("read %d bytes from %d (will write to %d)\n", total_n, from, to);
@@ -64,13 +75,15 @@ int preeny_socket_sync(int from, int to, int timeout)
 	n = 0;
 	while (n != total_n)
 	{
-		r = write(to, read_buf, total_n - n);
+		//preeny_info("start write() sync from %d to %d\n", from, to);
+		r = write(to, read_buf, total_n - n);//这里有可能阻塞
+		//preeny_info("stop write() sync from %d to %d\n", from, to);
 		if (r < 0)
 		{
 			strerror_r(errno, error_buf, 1024);
 			preeny_info("synchronization of fd %d to %d shutting down due to read error '%s'\n", from, to, error_buf);
 			return -1;
-		}
+		} 
 		n += r;
 	}
 
@@ -111,7 +124,7 @@ __attribute__((destructor)) void preeny_desock_shutdown()
 	preeny_debug("... shutdown complete!\n");
 }
 
-void preeny_socket_sync_loop(int from, int to)
+int preeny_socket_sync_loop(int from, int to)
 {
 	char error_buf[1024];
 	int r;
@@ -120,8 +133,9 @@ void preeny_socket_sync_loop(int from, int to)
 
 	while (!preeny_desock_shutdown_flag)
 	{
+		//r = preeny_socket_sync(from, to, 15);
 		r = preeny_socket_sync(from, to, 15);
-		if (r < 0) return;
+		if (r < 0) return r;
 	}
 }
 
@@ -130,17 +144,20 @@ void preeny_socket_sync_loop(int from, int to)
 
 void *preeny_socket_sync_to_back(void *fd)
 {
+	int r;
 	int front_fd = (int)fd;
 	int back_fd = PREENY_SOCKET(front_fd);
-	preeny_socket_sync_loop(back_fd, 1);
+	r = preeny_socket_sync_loop(back_fd, 1);
 	return NULL;
 }
 
 void *preeny_socket_sync_to_front(void *fd)
 {
+	int r;
 	int front_fd = (int)fd;
 	int back_fd = PREENY_SOCKET(front_fd);
-	preeny_socket_sync_loop(0, back_fd);
+	r = preeny_socket_sync_loop(0, back_fd);
+	
 	return NULL;
 }
 
@@ -199,6 +216,10 @@ int socket(int domain, int type, int protocol)
 		perror("failed creating front-sync thread");
 		return -1;
 	}
+
+	preeny_debug("waiting for socket %d sync to front thread terminate\n", fds[0]);
+	pthread_join(*(preeny_socket_threads_to_front[fds[0]]), NULL);
+	preeny_debug("socket sync to front thread has terminated\n");
 
 	r = pthread_create(preeny_socket_threads_to_back[fds[0]], NULL, (void*(*)(void*))preeny_socket_sync_to_back, (void *)front_socket);
 	if (r)
