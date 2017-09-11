@@ -12,7 +12,8 @@
 #include <errno.h>
 #include <stdio.h>
 #include <poll.h>
-
+#include <linux/memfd.h>
+#include <sys/syscall.h>
 #include "logging.h"
 
 #define PREENY_MAX_FD 8192
@@ -24,6 +25,10 @@
 int preeny_desock_shutdown_flag = 0;
 pthread_t *preeny_socket_threads_to_front[PREENY_MAX_FD] = { 0 };
 pthread_t *preeny_socket_threads_to_back[PREENY_MAX_FD] = { 0 };
+
+//add by dddong. used for more than one socket connection.subsequent socket will use random data returned by malloc()
+char *data_for_second_sock = NULL;
+#define DATA_SIZE 10000
 
 int preeny_socket_sync(int from, int to, int timeout)
 {
@@ -75,9 +80,7 @@ int preeny_socket_sync(int from, int to, int timeout)
 	n = 0;
 	while (n != total_n)
 	{
-		//preeny_info("start write() sync from %d to %d\n", from, to);
 		r = write(to, read_buf, total_n - n);//这里有可能阻塞
-		//preeny_info("stop write() sync from %d to %d\n", from, to);
 		if (r < 0)
 		{
 			strerror_r(errno, error_buf, 1024);
@@ -100,6 +103,7 @@ __attribute__((destructor)) void preeny_desock_shutdown()
 	preeny_desock_shutdown_flag = 1;
 
 
+	/*
 	for (i = 0; i < PREENY_MAX_FD; i++)
 	{
 		if (preeny_socket_threads_to_front[i])
@@ -120,7 +124,9 @@ __attribute__((destructor)) void preeny_desock_shutdown()
 			while (preeny_socket_sync(PREENY_SOCKET(i), 1, 0) > 0);
 		}
 	}
+	*/
 
+	if(data_for_second_sock) free(data_for_second_sock);
 	preeny_debug("... shutdown complete!\n");
 }
 
@@ -133,7 +139,6 @@ int preeny_socket_sync_loop(int from, int to)
 
 	while (!preeny_desock_shutdown_flag)
 	{
-		//r = preeny_socket_sync(from, to, 15);
 		r = preeny_socket_sync(from, to, 15);
 		if (r < 0) return r;
 	}
@@ -169,17 +174,24 @@ int (*original_bind)(int, const struct sockaddr *, socklen_t);
 int (*original_listen)(int, int);
 int (*original_accept)(int, struct sockaddr *, socklen_t *);
 int (*original_connect)(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+ssize_t (*original_send)(int socket, const void *buffer, size_t length, int flags);
 __attribute__((constructor)) void preeny_desock_orig()
 {
+	printf("+++ I'm in constructor!\n");
 	original_socket = dlsym(RTLD_NEXT, "socket");
 	original_listen = dlsym(RTLD_NEXT, "listen");
 	original_accept = dlsym(RTLD_NEXT, "accept");
 	original_bind = dlsym(RTLD_NEXT, "bind");
 	original_connect = dlsym(RTLD_NEXT, "connect");
+	original_send = dlsym(RTLD_NEXT, "send");
 }
+
+int preeny_is_socket_func_first_called = 1;
+//int preeny_front_sockfd = -1;
 
 int socket(int domain, int type, int protocol)
 {
+	int memfd;	//一个内存文件的描述符
 	int fds[2];
 	int front_socket;
 	int back_socket;
@@ -190,6 +202,29 @@ int socket(int domain, int type, int protocol)
 		return original_socket(domain, type, protocol);
 	}
 	
+	if(preeny_is_socket_func_first_called) {
+		//preeny_is_socket_func_first_called = 0;
+	} else {
+		preeny_info("socket() func has been called more than once.fill stdin with random data\n");
+		//return preeny_front_sockfd;
+		//重定向标准输入到一个内存文件中
+		memfd = syscall(SYS_memfd_create, "memory_fuzz_file", 0);
+		if (memfd < 0) {
+			perror("memfd_create() error......");
+		}
+		if(!data_for_second_sock) {
+			data_for_second_sock = (char *)malloc(DATA_SIZE);
+			memset(data_for_second_sock, 'z', DATA_SIZE);
+			if(!data_for_second_sock) perror("malloc()");
+		}
+		if(write(memfd, data_for_second_sock, DATA_SIZE) != DATA_SIZE) {
+			perror("write()");
+		}
+		if(lseek(memfd, 0, SEEK_SET) == -1) perror("lseek()");
+		if(dup2(memfd, 0) == -1) perror("dup2(memfd, 0)");
+		close(memfd);
+		preeny_info("successful write %d bytes to stdin\n", DATA_SIZE);
+	}
 	int r = socketpair(AF_UNIX, type, 0, fds);
 	preeny_debug("Intercepted socket()!\n");
 
@@ -208,7 +243,7 @@ int socket(int domain, int type, int protocol)
 	preeny_debug("... dup into socketpair (%d, %d)\n", fds[0], back_socket);
 
 	preeny_socket_threads_to_front[fds[0]] = malloc(sizeof(pthread_t));
-	preeny_socket_threads_to_back[fds[0]] = malloc(sizeof(pthread_t));
+	//preeny_socket_threads_to_back[fds[0]] = malloc(sizeof(pthread_t));
 
 	r = pthread_create(preeny_socket_threads_to_front[fds[0]], NULL, (void*(*)(void*))preeny_socket_sync_to_front, (void *)front_socket);
 	if (r)
@@ -218,16 +253,21 @@ int socket(int domain, int type, int protocol)
 	}
 
 	preeny_debug("waiting for socket %d sync to front thread terminate\n", fds[0]);
-	pthread_join(*(preeny_socket_threads_to_front[fds[0]]), NULL);
+	if(r = pthread_join(*(preeny_socket_threads_to_front[fds[0]]), NULL)) {
+		perror("pthread_join() failed");
+		exit(2);
+	}
 	preeny_debug("socket sync to front thread has terminated\n");
 
+	free(preeny_socket_threads_to_front[fds[0]]);
+	/*
 	r = pthread_create(preeny_socket_threads_to_back[fds[0]], NULL, (void*(*)(void*))preeny_socket_sync_to_back, (void *)front_socket);
 	if (r)
 	{
 		perror("failed creating back-sync thread");
 		return -1;
 	}
-
+	*/
 	return fds[0];
 }
 
@@ -279,4 +319,11 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
 	if (preeny_socket_threads_to_front[sockfd]) return 0;
 	else return original_connect(sockfd, addr, addrlen);
+}
+
+
+ssize_t send(int socket, const void *buffer, size_t length, int flags)
+{
+	if (preeny_socket_threads_to_front[socket]) return length;
+	else return original_send(socket, buffer, length, flags);
 }
